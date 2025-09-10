@@ -10,7 +10,7 @@ import {
   ViewabilityConfig,
   ViewToken,
 } from 'react-native';
-import { Video, ResizeMode } from 'expo-av';
+import { Video, ResizeMode, AVPlaybackStatus, Audio } from 'expo-av';
 import { Ionicons } from '@expo/vector-icons';
 
 interface Clip {
@@ -36,6 +36,8 @@ interface VideoItemProps {
   totalClips: number;
   filmTitle: string;
   onProgress: (currentTime: number, duration: number) => void;
+  shouldAutoPlay: boolean;
+  onUserStartedPlaying: () => void;
 }
 
 const { width: screenWidth, height: screenHeight } = Dimensions.get('window');
@@ -47,38 +49,59 @@ const VideoItem: React.FC<VideoItemProps> = ({
   clipIndex, 
   totalClips, 
   filmTitle,
-  onProgress 
+  onProgress,
+  shouldAutoPlay,
+  onUserStartedPlaying
 }) => {
-  const [paused, setPaused] = useState(!isVisible);
+  const [isPlaying, setIsPlaying] = useState(false);
   const [showControls, setShowControls] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [isLoaded, setIsLoaded] = useState(false);
   const videoRef = useRef<Video>(null);
+  const controlsTimeoutRef = useRef<number | null>(null);
 
-  // Pause/play based on visibility
+  // Handle visibility changes
   useEffect(() => {
-    setPaused(!isVisible);
+    if (!isVisible && videoRef.current) {
+      // Pause video when not visible
+      videoRef.current.pauseAsync();
+      setIsPlaying(false);
+    }
   }, [isVisible]);
 
-  // Auto-hide controls after 3 seconds
+  // Auto-hide controls after 2 seconds
   useEffect(() => {
     if (showControls) {
-      const timer = setTimeout(() => {
+      if (controlsTimeoutRef.current) {
+        clearTimeout(controlsTimeoutRef.current);
+      }
+      controlsTimeoutRef.current = setTimeout(() => {
         setShowControls(false);
-      }, 3000);
-      return () => clearTimeout(timer);
+      }, 2000);
     }
+    
+    return () => {
+      if (controlsTimeoutRef.current) {
+        clearTimeout(controlsTimeoutRef.current);
+      }
+    };
   }, [showControls]);
 
   const togglePlayPause = async () => {
-    if (videoRef.current) {
-      if (paused) {
-        await videoRef.current.playAsync();
-      } else {
+    if (!videoRef.current || !isLoaded) return;
+    
+    try {
+      if (isPlaying) {
         await videoRef.current.pauseAsync();
+        setIsPlaying(false);
+      } else {
+        await videoRef.current.playAsync();
+        setIsPlaying(true);
       }
-      setPaused(!paused);
+      setShowControls(true); // Show controls when play state changes
+    } catch (error) {
+      console.error('Error toggling play/pause:', error);
     }
   };
 
@@ -86,18 +109,34 @@ const VideoItem: React.FC<VideoItemProps> = ({
     setShowControls(!showControls);
   };
 
-  const handlePlaybackStatusUpdate = (status: any) => {
+  const handlePlaybackStatusUpdate = (status: AVPlaybackStatus) => {
     if (status.isLoaded) {
       setIsLoaded(true);
       const currentTimeSeconds = status.positionMillis / 1000;
-      const durationSeconds = status.durationMillis / 1000;
+      const durationSeconds = status.durationMillis ? status.durationMillis / 1000 : 0;
       
       setCurrentTime(currentTimeSeconds);
       setDuration(durationSeconds);
-      setPaused(!status.isPlaying);
+      setIsPlaying(status.isPlaying);
       
       // Call progress callback
       onProgress(currentTimeSeconds, durationSeconds);
+      
+      // Auto-play when video loads and is visible
+      if (!status.isPlaying && isVisible && !status.didJustFinish) {
+        // Only auto-play on initial load
+        if (currentTimeSeconds === 0) {
+          videoRef.current?.playAsync();
+            }
+      }
+      
+      // Handle video end
+      if (status.didJustFinish) {
+        setIsPlaying(false);
+        setShowControls(true);
+      }
+    } else {
+      setIsLoaded(false);
     }
   };
 
@@ -121,9 +160,14 @@ const VideoItem: React.FC<VideoItemProps> = ({
           source={{ uri: clip.hlsUrl }}
           style={styles.video}
           resizeMode={ResizeMode.COVER}
-          shouldPlay={!paused && isVisible}
+          shouldPlay={false} // We'll control playback manually
           isLooping={false}
           onPlaybackStatusUpdate={handlePlaybackStatusUpdate}
+          useNativeControls={false}
+          volume={1.0}
+          isMuted={false} // Explicitly set to not muted
+          shouldCorrectPitch={true}
+          rate={1.0}
         />
 
         {/* Loading Indicator */}
@@ -133,19 +177,22 @@ const VideoItem: React.FC<VideoItemProps> = ({
           </View>
         )}
 
-        {/* Play/Pause Button - Always visible but subtle */}
-        <View style={styles.playButtonContainer}>
+        {/* Play/Pause Button Overlay */}
+        {(showControls || !isPlaying) && (
           <TouchableOpacity
-            style={[styles.playButton, paused && styles.playButtonVisible]}
+            style={styles.playButtonOverlay}
             onPress={togglePlayPause}
+            activeOpacity={0.9}
           >
-            <Ionicons 
-              name={paused ? 'play' : 'pause'} 
-              size={60} 
-              color="rgba(255, 255, 255, 0.8)" 
-            />
+            <View style={styles.playButton}>
+              <Ionicons 
+                name={isPlaying ? 'pause' : 'play'} 
+                size={60} 
+                color="rgba(255, 255, 255, 0.9)" 
+              />
+            </View>
           </TouchableOpacity>
-        </View>
+        )}
 
         {/* Right Side Info Panel */}
         <View style={styles.rightPanel}>
@@ -202,7 +249,27 @@ export default function VerticalVideoPlayer({
   filmTitle,
 }: VerticalVideoPlayerProps) {
   const [currentIndex, setCurrentIndex] = useState(initialClipIndex);
+  const [hasUserStartedPlaying, setHasUserStartedPlaying] = useState(false);
   const flatListRef = useRef<FlatList>(null);
+
+  // Configure audio session on mount
+  useEffect(() => {
+    const configureAudio = async () => {
+      try {
+        await Audio.setAudioModeAsync({
+          allowsRecordingIOS: false,
+          playsInSilentModeIOS: true, // This allows audio to play even in silent mode
+          staysActiveInBackground: false,
+          shouldDuckAndroid: true,
+          playThroughEarpieceAndroid: false,
+        });
+      } catch (error) {
+        console.error('Error configuring audio:', error);
+      }
+    };
+    
+    configureAudio();
+  }, []);
 
   // Viewability config - video is considered viewable when 70% visible
   const viewabilityConfig: ViewabilityConfig = {
@@ -232,6 +299,8 @@ export default function VerticalVideoPlayer({
         totalClips={clips.length}
         filmTitle={filmTitle}
         onProgress={handleProgress}
+        shouldAutoPlay={hasUserStartedPlaying}
+        onUserStartedPlaying={() => setHasUserStartedPlaying(true)}
       />
     );
   };
@@ -257,6 +326,7 @@ export default function VerticalVideoPlayer({
           offset: screenHeight * index,
           index,
         })}
+        removeClippedSubviews={false} // Important for video performance
       />
     </View>
   );
@@ -293,7 +363,7 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 18,
   },
-  playButtonContainer: {
+  playButtonOverlay: {
     position: 'absolute',
     top: 0,
     left: 0,
@@ -301,17 +371,11 @@ const styles = StyleSheet.create({
     bottom: 0,
     justifyContent: 'center',
     alignItems: 'center',
-    pointerEvents: 'none',
   },
   playButton: {
-    backgroundColor: 'rgba(0, 0, 0, 0.3)',
+    backgroundColor: 'rgba(0, 0, 0, 0.5)',
     borderRadius: 50,
     padding: 20,
-    opacity: 0,
-    pointerEvents: 'auto',
-  },
-  playButtonVisible: {
-    opacity: 1,
   },
   rightPanel: {
     position: 'absolute',
@@ -320,6 +384,7 @@ const styles = StyleSheet.create({
     bottom: 150,
     alignItems: 'center',
     justifyContent: 'space-between',
+    pointerEvents: 'none', // Don't block touches
   },
   clipCounter: {
     backgroundColor: 'rgba(0, 0, 0, 0.6)',
@@ -354,6 +419,7 @@ const styles = StyleSheet.create({
     bottom: 50,
     left: 20,
     right: 80,
+    pointerEvents: 'none', // Don't block touches
   },
   clipInfo: {
     backgroundColor: 'rgba(0, 0, 0, 0.6)',
@@ -382,6 +448,7 @@ const styles = StyleSheet.create({
     left: 20,
     right: 20,
     alignItems: 'center',
+    pointerEvents: 'none', // Don't block touches
   },
   swipeText: {
     color: '#fff',

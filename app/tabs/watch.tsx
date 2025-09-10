@@ -9,7 +9,7 @@ import {
 } from 'react-native';
 import { useAuth } from '@/contexts/AuthContext';
 import { useLocalSearchParams } from 'expo-router';
-import VerticalVideoPlayer from '@/components/VerticalVideoPlayer';
+import VerticalVideoPlayer from '../../components/VerticalVideoPlayer';
 import { clipsService, Film, WatchProgress } from '@/lib/clipsService';
 
 export default function Watch() {
